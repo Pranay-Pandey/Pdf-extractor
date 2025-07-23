@@ -1,0 +1,7 @@
+# Requirements for the document extraction service
+markitdown
+pytesseract
+pdf2image
+Pillow
+PyPDF2
+python-dotenv
