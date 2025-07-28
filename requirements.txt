@@ -1,7 +1,22 @@
 # Requirements for the document extraction service
 markitdown
+fastapi
+boto3
+pymongo
+python-dotenv
 pytesseract
 pdf2image
 Pillow
 PyPDF2
 python-dotenv
+uvicorn
+streamlit
+requests
+python-dotenv
+PyPDF2
+pdf2image
+pytesseract
+Pillow
+google-generativeai
+pymongo
+markitdown
