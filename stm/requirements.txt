@@ -1,0 +1,10 @@
+streamlit
+requests
+python-dotenv
+PyPDF2
+pdf2image
+pytesseract
+Pillow
+google-generativeai
+pymongo
+markitdown
