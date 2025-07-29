@@ -84,6 +84,7 @@ def gemini_extract(content, prompt):
 
 # API endpoint
 class ExtractRequest(BaseModel):
+    workspace_id: str
     doc_id: str
     prompt: Optional[str] = None
 
@@ -94,7 +95,9 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     # Download PDF from DOC_ENDPOINT
     if not DOC_ENDPOINT:
         raise HTTPException(status_code=500, detail="DOC_ENDPOINT environment variable not set.")
-    url = f"{DOC_ENDPOINT.rstrip('/')}/{req.doc_id}"
+    if not req.workspace_id or not req.doc_id:
+        raise HTTPException(status_code=400, detail="workspace_id and doc_id are required.")
+    url = f"{DOC_ENDPOINT.rstrip('/')}/{req.workspace_id}/vault/{req.doc_id}"
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -124,6 +127,7 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     jsonStartIndex = extracted_json.find("{")
     jsonEndIndex = extracted_json.rfind("}")
     if jsonStartIndex == -1 or jsonEndIndex == -1 or jsonEndIndex < jsonStartIndex:
+        print("Failed to find valid JSON in Gemini response., response:", extracted_json)
         raise HTTPException(status_code=500, detail="Invalid JSON response from Gemini.")
     extracted_json = extracted_json[jsonStartIndex:jsonEndIndex + 1]  # Ensure we only parse the JSON part
     print("Extracted JSON:", extracted_json)
@@ -147,9 +151,11 @@ def extract_from_doc_endpoint(req: ExtractRequest):
         "document_type": document_type,
         "extracted_json": data if 'data' in locals() else extracted_json,
         "raw_text": content,
+        "workspace_id": req.workspace_id,
         **{key: value for key, value in data.items() if key not in ["_id", "document_type", "extracted_json", "raw_text"]}
     }
-    collection.replace_one({"_id": req.doc_id}, record, upsert=True)
+    # make document unique by using doc_id and workspace_id
+    collection.replace_one({"_id": req.doc_id, "workspace_id": req.workspace_id}, record, upsert=True)
 
     return {"status": "success", "document_type": document_type, "data": data if 'data' in locals() else extracted_json}
 
