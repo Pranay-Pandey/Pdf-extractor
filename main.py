@@ -5,19 +5,11 @@ from pydantic import BaseModel
 from typing import Optional
 import requests
 from dotenv import load_dotenv
-import PyPDF2
-from pdf2image import convert_from_path
-import pytesseract
-from PIL import Image
+import fitz  # PyMuPDF
 import google.generativeai as genai
 from pymongo import MongoClient
 from enum import Enum
 import json
-try:
-    from markitdown.extract import extract as markitdown_extract
-    MARKITDOWN_AVAILABLE = True
-except ImportError:
-    MARKITDOWN_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -76,36 +68,13 @@ DEFAULT_PROMPT = (
     "Respond in JSON. "
 )
 
-# Helper functions
-def is_pdf_text_based(pdf_path):
-    with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text = page.extract_text()
-            if text and text.strip():
-                return True
-    return False
 
+# Helper function: extract text from PDF using PyMuPDF
 def extract_text_from_pdf(pdf_path):
-    if MARKITDOWN_AVAILABLE:
-        try:
-            return markitdown_extract(pdf_path)
-        except Exception:
-            pass
+    doc = fitz.open(pdf_path)
     text = ""
-    with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-def extract_text_from_image_pdf(pdf_path):
-    images = convert_from_path(pdf_path)
-    text = ""
-    for image in images:
-        text += pytesseract.image_to_string(image) + "\n"
+    for page in doc:
+        text += page.get_text()
     return text
 
 def gemini_extract(content, prompt):
@@ -119,6 +88,7 @@ class ExtractRequest(BaseModel):
     prompt: Optional[str] = None
 
 
+
 @app.post("/extract")
 def extract_from_doc_endpoint(req: ExtractRequest):
     # Download PDF from DOC_ENDPOINT
@@ -128,9 +98,7 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     try:
         response = requests.get(url)
         response.raise_for_status()
-
         pdfURL = response.json().get('url', url)  # Use the URL from the response if available
-        # Download the PDF file from another request to this pdfURL
         response = requests.get(pdfURL)
         response.raise_for_status()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -139,11 +107,8 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF from DOC_ENDPOINT: {e}")
 
-    # Extract text
-    if is_pdf_text_based(tmp_path):
-        content = extract_text_from_pdf(tmp_path)
-    else:
-        content = extract_text_from_image_pdf(tmp_path)
+    # Extract text (using PyMuPDF for all PDFs)
+    content = extract_text_from_pdf(tmp_path)
 
     # Build prompt
     prompt = DEFAULT_PROMPT
@@ -176,22 +141,17 @@ def extract_from_doc_endpoint(req: ExtractRequest):
         return {"status_code": 500, "status": "error", "message": str(e)}
         document_type = None
 
-
     # Store in MongoDB
     record = {
         "_id": req.doc_id,
         "document_type": document_type,
         "extracted_json": data if 'data' in locals() else extracted_json,
         "raw_text": content,
-        **{key: value for key, value in data.items()}
+        **{key: value for key, value in data.items() if key not in ["_id", "document_type", "extracted_json", "raw_text"]}
     }
     collection.replace_one({"_id": req.doc_id}, record, upsert=True)
 
     return {"status": "success", "document_type": document_type, "data": data if 'data' in locals() else extracted_json}
-
-@app.get("/doctor")
-def healthCheck():
-    return {"status": "ok"}
 
 # Run the FastAPI app
 if __name__ == "__main__":
