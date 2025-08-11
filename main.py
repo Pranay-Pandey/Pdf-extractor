@@ -1,4 +1,6 @@
 import os
+from pinecone import Pinecone
+import os
 import tempfile
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from pydantic import BaseModel
@@ -10,6 +12,14 @@ import google.generativeai as genai
 from pymongo import MongoClient
 from enum import Enum
 import json
+import logging
+import easyocr
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,  # or DEBUG for more details
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 # Load environment variables
 load_dotenv()
@@ -22,7 +32,14 @@ collection = db[os.getenv("MONGO_COLLECTION", "documents")]
 
 
 # DOC_ENDPOINT setup
+# DOC_ENDPOINT setup
 DOC_ENDPOINT = os.getenv('DOC_ENDPOINT')
+
+# Pinecone setup
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
+PINECONE_INDEX = os.getenv('PINECONE_INDEX', 'doc-chunks')
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(PINECONE_INDEX)
 
 # Gemini setup
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -65,7 +82,7 @@ DEFAULT_PROMPT = (
     f"{[e.value for e in DocumentType]}. "
     "Extract the document type as 'document_type' (from the enum), and extract all relevant metadata as JSON. Do not make any nested JSON objects, all fields should be at the top level. "
     "If possible, extract fields like parties, dates, relief, etc. "
-    "Respond in JSON. "
+    "Respond in only in JSON. No thinking response or explanations."
 )
 
 
@@ -74,19 +91,76 @@ def extract_text_from_pdf(pdf_path):
     doc = fitz.open(pdf_path)
     text = ""
     for page in doc:
-        text += page.get_text()
+        page_text = page.get_text()
+        if page_text.strip():
+            text += page_text
+        else:
+            # If no text, try OCR using easyocr
+            try:
+                reader = easyocr.Reader(['en'])
+                pix = page.get_pixmap()
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                ocr_result = reader.readtext(img, detail=0)
+                ocr_text = '\n'.join(ocr_result)
+                text += ocr_text
+                logging.info("OCR extracted text from page.")
+            except Exception as e:
+                logging.error(f"OCR failed: {e}")
     return text
 
+# Helper functions
 def gemini_extract(content, prompt):
     model = genai.GenerativeModel('gemini-2.0-flash')
     response = model.generate_content([prompt, content])
     return response.text
 
 # API endpoint
+
+def chunk_text(text, chunk_size=1000):
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def get_chunk_embedding(pc, chunk: str):
+    if not chunk.lower().startswith("passage: "):
+        chunk = "passage: " + chunk
+    return pc.inference.embed(
+        model="multilingual-e5-large",
+        inputs=[chunk],
+        parameters={"input_type": "passage"},
+    )[0]["values"]
+
+def get_query_embedding(pc, query: str):
+    if not query.lower().startswith("query: "):
+        query = "query: " + query
+    return pc.inference.embed(
+        model="multilingual-e5-large",
+        inputs=[query],
+        parameters={"input_type": "query"},
+    )[0]["values"]
+
 class ExtractRequest(BaseModel):
     workspace_id: str
     doc_id: str
     prompt: Optional[str] = None
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+@app.post("/search")
+def search_chunks(req: SearchRequest):
+    embedding = get_query_embedding(pc, req.query)
+    results = index.query(vector=embedding, top_k=req.top_k, include_metadata=True)
+    matches = []
+    for match in results.get('matches', []):
+        meta = match.get('metadata', {})
+        matches.append({
+            "fileId": meta.get('fileId'),
+            "workspace_id": meta.get('workspace_id'),
+            "chunkId": meta.get('chunkId'),
+            "text": meta.get('text'),
+            "score": match.get('score')
+        })
+    return {"matches": matches}
 
 
 
@@ -107,12 +181,17 @@ def extract_from_doc_endpoint(req: ExtractRequest):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(response.content)
             tmp_path = tmp.name
+            logging.info("Downloaded PDF to temporary file: %s", tmp_path)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF from DOC_ENDPOINT: {e}")
 
     # Extract text (using PyMuPDF for all PDFs)
     content = extract_text_from_pdf(tmp_path)
+    logging.info("Extracted content from PDF: %s", content[:1000])  # Log first 1000 characters for debugging
 
+    if not content.strip():
+        logging.warning("No content extracted from PDF.")
+        return {"status_code": 400, "status": "error", "message": "No content extracted from PDF."}
     # Build prompt
     prompt = DEFAULT_PROMPT
     if req.prompt:
@@ -127,21 +206,21 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     jsonStartIndex = extracted_json.find("{")
     jsonEndIndex = extracted_json.rfind("}")
     if jsonStartIndex == -1 or jsonEndIndex == -1 or jsonEndIndex < jsonStartIndex:
-        print("Failed to find valid JSON in Gemini response., response:", extracted_json)
+        logging.error("Failed to find valid JSON in Gemini response., response: %s", extracted_json)
         raise HTTPException(status_code=500, detail="Invalid JSON response from Gemini.")
     extracted_json = extracted_json[jsonStartIndex:jsonEndIndex + 1]  # Ensure we only parse the JSON part
-    print("Extracted JSON:", extracted_json)
+    logging.info("JSON Data extracted Successfully")
     try:
         data = json.loads(extracted_json)
         document_type = data.get("document_type")
-        print("Extracted document type:", document_type)
-        print("Extracted data:", data)
+        logging.info("Extracted document type: %s", document_type)
     except Exception as e:
         data = {
             "error": "Failed to parse extracted JSON",
             "details": str(e)
         }
-        print(f"Error parsing extracted JSON: {e}")
+        logging.info("Failed to parse extracted JSON: %s", extracted_json)
+        logging.error("Error parsing extracted JSON: %s", e)
         return {"status_code": 500, "status": "error", "message": str(e)}
         document_type = None
 
@@ -157,9 +236,36 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     # make document unique by using doc_id and workspace_id
     collection.replace_one({"_id": req.doc_id, "workspace_id": req.workspace_id}, record, upsert=True)
 
+    # Chunk and upload to Pinecone
+    logging.info("Preparing Pinecone vectors...")
+    logging.info("Content to be chunked: %s", content)
+    logging.info(content)
+    chunks = chunk_text(content, chunk_size=1000)
+    pinecone_vectors = []
+    logging.info("Generating embeddings for Pinecone... Total chunks: %d", len(chunks))
+    for i, chunk in enumerate(chunks):
+        embedding = get_chunk_embedding(pc, chunk)
+        pinecone_vectors.append({
+            "id": f"{req.doc_id}_chunk_{i}",
+            "values": embedding,
+            "metadata": {
+                "fileId": req.doc_id,
+                "workspace_id": req.workspace_id,
+                "chunkId": i,
+                "text": chunk
+            }
+        })
+    if pinecone_vectors:
+        index.upsert(vectors=pinecone_vectors)
+        print("Pinecone vectors upserted.")
+
     return {"status": "success", "document_type": document_type, "data": data if 'data' in locals() else extracted_json}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
 
 # Run the FastAPI app
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")

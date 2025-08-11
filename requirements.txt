@@ -1,22 +1,13 @@
-# Requirements for the document extraction service
 fastapi
 boto3
-pymongo
-python-dotenv
 PyPDF2
-python-dotenv
-uvicorn
 streamlit
-requests
-PyPDF2
 google-generativeai
-pymongo
-# Requirements for the document extraction service
 fastapi
 pymongo
 python-dotenv
 PyMuPDF
-PyPDF2
 uvicorn
 requests
-google-generativeai
+pinecone
+pdf2image
