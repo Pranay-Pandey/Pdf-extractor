@@ -15,6 +15,7 @@ import json
 import logging
 import easyocr
 import numpy as np
+import OCR as ocr_module
 
 logging.basicConfig(
     level=logging.INFO,  # or DEBUG for more details
@@ -88,25 +89,20 @@ DEFAULT_PROMPT = (
 
 # Helper function: extract text from PDF using PyMuPDF
 def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        page_text = page.get_text()
-        if page_text.strip():
-            text += page_text
-        else:
-            # If no text, try OCR using easyocr
-            try:
-                reader = easyocr.Reader(['en'])
-                pix = page.get_pixmap()
-                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                ocr_result = reader.readtext(img, detail=0)
-                ocr_text = '\n'.join(ocr_result)
-                text += ocr_text
-                logging.info("OCR extracted text from page.")
-            except Exception as e:
-                logging.error(f"OCR failed: {e}")
-    return text
+    output_folder = os.path.join(tempfile.gettempdir(), "pdf_images")
+    output_file = os.path.join(tempfile.gettempdir(), "extracted_text.txt")
+    # Run OCR
+    content = ocr_module.process_large_pdf(pdf_path, output_folder, output_file)
+    # Clean up temp images
+    image_paths = [os.path.join(output_folder, f) for f in os.listdir(output_folder) if f.endswith('.jpg')]
+    ocr_module.delete_temp_images(image_paths, output_folder)
+    # Remove output file
+    try:
+        if os.path.exists(output_file):
+            os.remove(output_file)
+    except Exception as e:
+        logging.warning(f"Failed to delete temp output file: {e}")
+    return content
 
 # Helper functions
 def gemini_extract(content, prompt):

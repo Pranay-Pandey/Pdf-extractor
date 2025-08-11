@@ -50,14 +50,14 @@ def process_large_pdf(pdf_path, output_folder, output_file):
         f.write(full_text)
     return full_text
 
-def delete_temp_images(image_paths):
+def delete_temp_images(image_paths, output_folder="pdf_images"):
     for path in image_paths:
         try:
             os.remove(path)
         except Exception as e:
             print(f"Error deleting {path}: {e}")
 
-    if not os.listdir(output_folder):
+    if os.path.exists(output_folder) and not os.listdir(output_folder):
         os.rmdir(output_folder)
 
 if __name__ == "__main__":
