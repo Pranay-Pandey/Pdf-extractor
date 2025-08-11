@@ -7,13 +7,11 @@ from pydantic import BaseModel
 from typing import Optional
 import requests
 from dotenv import load_dotenv
-import fitz  # PyMuPDF
 import google.generativeai as genai
 from pymongo import MongoClient
 from enum import Enum
 import json
 import logging
-import easyocr
 import numpy as np
 import OCR as ocr_module
 
