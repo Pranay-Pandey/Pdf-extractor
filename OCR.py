@@ -27,28 +27,29 @@ def batch_images(image_paths, batch_size=30):
     for i in range(0, len(image_paths), batch_size):
         yield image_paths[i:i + batch_size]
 
-def ocr_with_gemini(image_paths, instruction):
-    images = [Image.open(path) for path in image_paths]
+def ocr_with_gemini(image_path, instruction):
+    image = Image.open(image_path)
     prompt = f"""
     {instruction}
-    These are pages from a PDF document. Extract all text content while preserving the structure.
+    This is a page from a PDF document. Extract all text content while preserving the structure.
     Pay special attention to tables, columns, headers, and any structured content.
     Maintain paragraph breaks and formatting.
     """
-    response = model.generate_content([prompt, *images])
+    response = model.generate_content([prompt, image])
     return response.text
 
 def process_large_pdf(pdf_path, output_folder, output_file):
     image_paths = convert_pdf_to_images(pdf_path, output_folder)
-    batches = batch_images(image_paths, 30)
-    full_text = ""
-    for i, batch in enumerate(batches):
-        print(f"Processing batch {i+1}...")
-        batch_text = ocr_with_gemini(batch, "Extract all text, maintaining document structure")
-        full_text += f"\n\n--- BATCH {i+1} ---\n\n{batch_text}"
+    page_texts = {}
+    for i, image_path in enumerate(image_paths):
+        print(f"Processing page {i+1}...")
+        page_text = ocr_with_gemini(image_path, "Extract all text, maintaining document structure")
+        page_texts[i+1] = page_text
+    # Optionally write all text to file
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(full_text)
-    return full_text
+        for page_num, text in page_texts.items():
+            f.write(f"--- PAGE {page_num} ---\n{text}\n")
+    return page_texts
 
 def delete_temp_images(image_paths, output_folder="pdf_images"):
     for path in image_paths:

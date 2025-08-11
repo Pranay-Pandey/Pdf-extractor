@@ -154,7 +154,8 @@ def search_chunks(req: SearchRequest):
             "workspace_id": meta.get('workspace_id'),
             "chunkId": meta.get('chunkId'),
             "text": meta.get('text'),
-            "score": match.get('score')
+            "score": match.get('score'),
+            "pageId": meta.get('pageId', None),
         })
     return {"matches": matches}
 
@@ -181,35 +182,31 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF from DOC_ENDPOINT: {e}")
 
-    # Extract text (using PyMuPDF for all PDFs)
-    content = extract_text_from_pdf(tmp_path)
-    logging.info("Extracted content from PDF: %s", content[:1000])  # Log first 1000 characters for debugging
+    page_texts = extract_text_from_pdf(tmp_path)  # dict: {page_num: text}
+    logging.info("Extracted content from PDF: %s", page_texts)
 
-    if not content.strip():
+    if not page_texts or len(page_texts) == 0:
         logging.warning("No content extracted from PDF.")
         return {"status_code": 400, "status": "error", "message": "No content extracted from PDF."}
-    # Build prompt
+
+    # Join all page texts to get full document text
+    full_text = "\n\n".join([str(t) for t in page_texts.values()])
+
+    # Run Gemini extraction on the full document
     prompt = DEFAULT_PROMPT
     if req.prompt:
         prompt += " " + req.prompt
 
-    # Gemini extraction
     try:
-        extracted_json = gemini_extract(content, prompt)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini extraction failed: {e}")
-
-    jsonStartIndex = extracted_json.find("{")
-    jsonEndIndex = extracted_json.rfind("}")
-    if jsonStartIndex == -1 or jsonEndIndex == -1 or jsonEndIndex < jsonStartIndex:
-        logging.error("Failed to find valid JSON in Gemini response., response: %s", extracted_json)
-        raise HTTPException(status_code=500, detail="Invalid JSON response from Gemini.")
-    extracted_json = extracted_json[jsonStartIndex:jsonEndIndex + 1]  # Ensure we only parse the JSON part
-    logging.info("JSON Data extracted Successfully")
-    try:
+        extracted_json = gemini_extract(full_text, prompt)
+        jsonStartIndex = extracted_json.find("{")
+        jsonEndIndex = extracted_json.rfind("}")
+        if jsonStartIndex == -1 or jsonEndIndex == -1 or jsonEndIndex < jsonStartIndex:
+            logging.error("Failed to find valid JSON in Gemini response., response: %s", extracted_json)
+            raise HTTPException(status_code=500, detail="Invalid JSON response from Gemini.")
+        extracted_json = extracted_json[jsonStartIndex:jsonEndIndex + 1]
         data = json.loads(extracted_json)
         document_type = data.get("document_type")
-        logging.info("Extracted document type: %s", document_type)
     except Exception as e:
         data = {
             "error": "Failed to parse extracted JSON",
@@ -221,33 +218,30 @@ def extract_from_doc_endpoint(req: ExtractRequest):
         document_type = None
 
     # Store in MongoDB
+    page_texts_str = {str(k): v for k, v in page_texts.items()}
     record = {
         "_id": req.doc_id,
         "document_type": document_type,
-        "extracted_json": data if 'data' in locals() else extracted_json,
-        "raw_text": content,
+        "extracted_json": data,
+        "raw_text": page_texts_str,
         "workspace_id": req.workspace_id,
-        **{key: value for key, value in data.items() if key not in ["_id", "document_type", "extracted_json", "raw_text"]}
     }
-    # make document unique by using doc_id and workspace_id
     collection.replace_one({"_id": req.doc_id, "workspace_id": req.workspace_id}, record, upsert=True)
 
-    # Chunk and upload to Pinecone
+    # Chunk and upload to Pinecone (one chunk per page)
     logging.info("Preparing Pinecone vectors...")
-    logging.info("Content to be chunked: %s", content)
-    logging.info(content)
-    chunks = chunk_text(content, chunk_size=1000)
     pinecone_vectors = []
-    logging.info("Generating embeddings for Pinecone... Total chunks: %d", len(chunks))
-    for i, chunk in enumerate(chunks):
+    logging.info("Generating embeddings for Pinecone... Total pages: %d", len(page_texts))
+    for page_id, chunk in page_texts.items():
         embedding = get_chunk_embedding(pc, chunk)
         pinecone_vectors.append({
-            "id": f"{req.doc_id}_chunk_{i}",
+            "id": f"{req.doc_id}_page_{page_id}",
             "values": embedding,
             "metadata": {
                 "fileId": req.doc_id,
                 "workspace_id": req.workspace_id,
-                "chunkId": i,
+                "chunkId": page_id,
+                "pageId": page_id,
                 "text": chunk
             }
         })
@@ -255,7 +249,7 @@ def extract_from_doc_endpoint(req: ExtractRequest):
         index.upsert(vectors=pinecone_vectors)
         print("Pinecone vectors upserted.")
 
-    return {"status": "success", "document_type": document_type, "data": data if 'data' in locals() else extracted_json}
+    return {"status": "success", "document_type": document_type, "data": data}
 
 @app.get("/health")
 def health_check():
