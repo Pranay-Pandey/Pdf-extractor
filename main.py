@@ -4,7 +4,7 @@ import os
 import tempfile
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import requests
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -156,6 +156,120 @@ def search_chunks(req: SearchRequest):
             "pageId": meta.get('pageId', None),
         })
     return {"matches": matches}
+
+
+class WorkspaceSearchRequest(BaseModel):
+    query: str
+    workspace_id: str
+    top_k: int = 5
+
+
+@app.post("/workspace_search")
+def workspace_search(req: WorkspaceSearchRequest):
+    """Search only documents that belong to the provided workspace_id.
+    This endpoint filters Pinecone results by workspace_id.
+    """
+    if not req.query or not req.workspace_id:
+        raise HTTPException(status_code=400, detail="query and workspace_id are required")
+
+    embedding = get_query_embedding(pc, req.query)
+    try:
+        results = index.query(
+            vector=embedding,
+            top_k=req.top_k,
+            include_metadata=True,
+            filter={"workspace_id": req.workspace_id},
+        )
+    except Exception as e:
+        logging.error("Error querying Pinecone for workspace %s: %s", req.workspace_id, e)
+        raise HTTPException(status_code=500, detail=f"Search error: {e}")
+
+    matches = []
+    for match in results.get('matches', []):
+        meta = match.get('metadata', {})
+        matches.append({
+            "fileId": meta.get('fileId'),
+            "workspace_id": meta.get('workspace_id'),
+            "chunkId": meta.get('chunkId'),
+            "text": meta.get('text'),
+            "score": match.get('score'),
+            "pageId": meta.get('pageId', None),
+        })
+
+    return {"matches": matches}
+
+
+class MultiSearchRequest(BaseModel):
+    query: str
+    workspace_id: str
+    doc_ids: Optional[List[str]] = None
+    top_k: int = 5
+
+
+@app.post("/multi_retrieve")
+def multi_retrieve(req: MultiSearchRequest):
+    """Retrieve matches iteratively for each doc_id (or across workspace if none provided),
+    then re-rank all retrieved matches by score and return the top_k results.
+    """
+    if not req.query or not req.workspace_id:
+        raise HTTPException(status_code=400, detail="query and workspace_id are required")
+
+    embedding = get_query_embedding(pc, req.query)
+    collected = []
+
+    # If doc_ids provided, query per doc_id; otherwise query across workspace
+    if req.doc_ids:
+        for doc_id in req.doc_ids:
+            try:
+                results = index.query(
+                    vector=embedding,
+                    top_k=req.top_k,
+                    include_metadata=True,
+                    filter={"fileId": doc_id, "workspace_id": req.workspace_id},
+                )
+            except Exception as e:
+                logging.error("Error querying Pinecone for doc %s: %s", doc_id, e)
+                continue
+
+            for match in results.get("matches", []):
+                meta = match.get("metadata", {})
+                collected.append({
+                    "fileId": meta.get("fileId"),
+                    "workspace_id": meta.get("workspace_id"),
+                    "chunkId": meta.get("chunkId"),
+                    "text": meta.get("text"),
+                    "score": match.get("score"),
+                    "pageId": meta.get("pageId", None),
+                })
+    else:
+        # Search across the workspace
+        try:
+            results = index.query(
+                vector=embedding,
+                top_k=req.top_k,
+                include_metadata=True,
+                filter={"workspace_id": req.workspace_id},
+            )
+        except Exception as e:
+            logging.error("Error querying Pinecone for workspace %s: %s", req.workspace_id, e)
+            raise HTTPException(status_code=500, detail=f"Search error: {e}")
+
+        for match in results.get("matches", []):
+            meta = match.get("metadata", {})
+            collected.append({
+                "fileId": meta.get("fileId"),
+                "workspace_id": meta.get("workspace_id"),
+                "chunkId": meta.get("chunkId"),
+                "text": meta.get("text"),
+                "score": match.get("score"),
+                "pageId": meta.get("pageId", None),
+            })
+
+    # Re-rank collected results by score (descending) and return top_k overall
+    collected_sorted = sorted(collected, key=lambda x: x.get("score", 0), reverse=True)
+    top_results = collected_sorted[:req.top_k]
+
+    return {"matches": top_results, "total_found": len(collected)}
 
 
 
