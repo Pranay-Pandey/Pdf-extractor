@@ -2,3 +2,8 @@
 .env
 __pycache__/
 .vscode
+# Build and test artifacts
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+output/

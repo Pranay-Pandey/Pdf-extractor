@@ -15,6 +15,8 @@ import logging
 import numpy as np
 import OCR as ocr_module
 
+from pathlib import Path
+from pdf_extractor.core import inspect_http
 logging.basicConfig(
     level=logging.INFO,  # or DEBUG for more details
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -131,10 +133,16 @@ def get_query_embedding(pc, query: str):
         parameters={"input_type": "query"},
     )[0]["values"]
 
+
 class ExtractRequest(BaseModel):
     workspace_id: str
     doc_id: str
     prompt: Optional[str] = None
+
+
+class ExtractURLRequest(ExtractRequest):
+    url: str
+
 
 class SearchRequest(BaseModel):
     query: str
@@ -275,62 +283,80 @@ def multi_retrieve(req: MultiSearchRequest):
 
 @app.post("/extract")
 def extract_from_doc_endpoint(req: ExtractRequest):
-    # Download PDF from DOC_ENDPOINT
     if not DOC_ENDPOINT:
         raise HTTPException(status_code=500, detail="DOC_ENDPOINT environment variable not set.")
     if not req.workspace_id or not req.doc_id:
         raise HTTPException(status_code=400, detail="workspace_id and doc_id are required.")
+
     url = f"{DOC_ENDPOINT.rstrip('/')}/{req.workspace_id}/vault/{req.doc_id}"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
-        pdfURL = response.json().get('url', url)  # Use the URL from the response if available
-        response = requests.get(pdfURL)
+        pdf_url = response.json().get("url", url)
+        response = requests.get(pdf_url, timeout=60, stream=True)
         response.raise_for_status()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(response.content)
-            tmp_path = tmp.name
-            logging.info("Downloaded PDF to temporary file: %s", tmp_path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF from DOC_ENDPOINT: {e}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    tmp_file.write(chunk)
+            tmp_path = tmp_file.name
+        response.close()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF from DOC_ENDPOINT: {exc}")
 
-    page_texts = extract_text_from_pdf(tmp_path)  # dict: {page_num: text}
+    try:
+        return _process_pdf(req, tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@app.post("/extract_url")
+def extract_from_url_endpoint(req: ExtractURLRequest):
+    if not req.workspace_id or not req.doc_id:
+        raise HTTPException(status_code=400, detail="workspace_id and doc_id are required.")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="pdf-extractor-") as temp_dir:
+            downloaded = inspect_http(req.url, Path(temp_dir))
+            if not downloaded:
+                raise HTTPException(status_code=400, detail="No accessible PDF was found at the supplied URL.")
+            if len(downloaded) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"The supplied page exposed {len(downloaded)} PDFs. Pass a direct PDF URL or a page exposing exactly one PDF.",
+                )
+            return _process_pdf(req, str(downloaded[0].path))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to discover or download PDF: {exc}")
+
+
+def _process_pdf(req: ExtractRequest, pdf_path: str):
+    page_texts = extract_text_from_pdf(pdf_path)
     logging.info("Extracted content from PDF: %s", page_texts)
 
-    if not page_texts or len(page_texts) == 0:
+    if not page_texts:
         logging.warning("No content extracted from PDF.")
         return {"status_code": 400, "status": "error", "message": "No content extracted from PDF."}
 
-    # Join all page texts to get full document text
-    full_text = "\n\n".join([str(t) for t in page_texts.values()])
-
-    # Run Gemini extraction on the full document
-    prompt = DEFAULT_PROMPT
-    if req.prompt:
-        prompt += " " + req.prompt
-
+    full_text = "\n\n".join(str(text) for text in page_texts.values())
+    prompt = DEFAULT_PROMPT + (" " + req.prompt if req.prompt else "")
+    extracted_json = ""
     try:
         extracted_json = gemini_extract(full_text, prompt)
-        jsonStartIndex = extracted_json.find("{")
-        jsonEndIndex = extracted_json.rfind("}")
-        if jsonStartIndex == -1 or jsonEndIndex == -1 or jsonEndIndex < jsonStartIndex:
-            logging.error("Failed to find valid JSON in Gemini response., response: %s", extracted_json)
+        json_start = extracted_json.find("{")
+        json_end = extracted_json.rfind("}")
+        if json_start == -1 or json_end < json_start:
             raise HTTPException(status_code=500, detail="Invalid JSON response from Gemini.")
-        extracted_json = extracted_json[jsonStartIndex:jsonEndIndex + 1]
-        data = json.loads(extracted_json)
+        data = json.loads(extracted_json[json_start:json_end + 1])
         document_type = data.get("document_type")
-    except Exception as e:
-        data = {
-            "error": "Failed to parse extracted JSON",
-            "details": str(e)
-        }
-        logging.info("Failed to parse extracted JSON: %s", extracted_json)
-        logging.error("Error parsing extracted JSON: %s", e)
-        return {"status_code": 500, "status": "error", "message": str(e)}
-        document_type = None
+    except Exception as exc:
+        logging.error("Error parsing Gemini response: %s; response: %s", exc, extracted_json)
+        return {"status_code": 500, "status": "error", "message": str(exc)}
 
-    # Store in MongoDB
-    page_texts_str = {str(k): v for k, v in page_texts.items()}
+    page_texts_str = {str(key): value for key, value in page_texts.items()}
     record = {
         "_id": req.doc_id,
         "document_type": document_type,
@@ -340,10 +366,7 @@ def extract_from_doc_endpoint(req: ExtractRequest):
     }
     collection.replace_one({"_id": req.doc_id, "workspace_id": req.workspace_id}, record, upsert=True)
 
-    # Chunk and upload to Pinecone (one chunk per page)
-    logging.info("Preparing Pinecone vectors...")
     pinecone_vectors = []
-    logging.info("Generating embeddings for Pinecone... Total pages: %d", len(page_texts))
     for page_id, chunk in page_texts.items():
         embedding = get_chunk_embedding(pc, chunk)
         pinecone_vectors.append({
@@ -354,14 +377,15 @@ def extract_from_doc_endpoint(req: ExtractRequest):
                 "workspace_id": req.workspace_id,
                 "chunkId": page_id,
                 "pageId": page_id,
-                "text": chunk
-            }
+                "text": chunk,
+            },
         })
     if pinecone_vectors:
         index.upsert(vectors=pinecone_vectors)
-        print("Pinecone vectors upserted.")
+        logging.info("Pinecone vectors upserted.")
 
     return {"status": "success", "document_type": document_type, "data": data}
+
 
 @app.get("/health")
 def health_check():
